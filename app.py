@@ -9,6 +9,8 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
 
 load_dotenv()
@@ -19,6 +21,12 @@ LOG_PATH = Path("logs/audit.jsonl")
 SUBMISSIONS_PATH = Path("data/submissions.json")
 
 app = Flask(__name__)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
 
@@ -220,7 +228,7 @@ def stylometric_signal(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Signal 3: AI phrase / generic-polish heuristic (ensemble signal)
+# Signal 3: AI phrase / generic-polish heuristic (stretch ensemble signal)
 # ---------------------------------------------------------------------------
 
 def phrase_pattern_signal(text: str) -> Dict[str, Any]:
@@ -274,7 +282,7 @@ def phrase_pattern_signal(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Combining signals into a calibrated confidence score
+# Combining signals and generating labels
 # ---------------------------------------------------------------------------
 
 def combine_signals(signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -317,6 +325,23 @@ def combine_signals(signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def transparency_label(attribution: str, confidence: float) -> str:
+    if attribution == "likely_ai":
+        return (
+            "This submission appears likely AI-generated. Our system found strong "
+            "AI-like patterns, but this is not a final judgment; the creator may appeal."
+        )
+    if attribution == "likely_human":
+        return (
+            "This submission appears likely human-written. Our system found mostly "
+            "human-like patterns, but no automated check can prove authorship."
+        )
+    return (
+        "We are not confident enough to label this submission as AI- or human-written. "
+        "It will be shown without a strong attribution claim, and the creator can provide more context."
+    )
+
+
 def analyze_content(text: str) -> Dict[str, Any]:
     signals = {
         "llm_judge": llm_detection_signal(text),
@@ -324,7 +349,8 @@ def analyze_content(text: str) -> Dict[str, Any]:
         "phrase_pattern_heuristic": phrase_pattern_signal(text),
     }
     combined = combine_signals(signals)
-    return {**combined, "signals": signals}
+    label = transparency_label(combined["attribution"], combined["confidence"])
+    return {**combined, "signals": signals, "transparency_label": label}
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +362,8 @@ def home():
     return jsonify({
         "app": APP_NAME,
         "endpoints": {
-            "POST /submit": "Analyze text for attribution and confidence.",
+            "POST /submit": "Analyze text for attribution and return a transparency label.",
+            "POST /appeal": "Contest a classification and mark content under review.",
             "GET /log": "Return recent structured audit log entries.",
             "GET /content/<content_id>": "Return one stored content record.",
         },
@@ -344,6 +371,7 @@ def home():
 
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit():
     data = request.get_json(silent=True) or {}
     text = str(data.get("text", "")).strip()
@@ -359,10 +387,6 @@ def submit():
     content_id = str(uuid.uuid4())
     analysis = analyze_content(text)
 
-    # Milestone 4: real confidence scoring is wired in. The transparency label
-    # is still a placeholder; the three reader-facing variants arrive in M5.
-    label = "Placeholder label — the three transparency-label variants arrive in M5."
-
     record = {
         "content_id": content_id,
         "creator_id": creator_id,
@@ -372,7 +396,7 @@ def submit():
         "attribution": analysis["attribution"],
         "ai_score": analysis["ai_score"],
         "confidence": analysis["confidence"],
-        "transparency_label": label,
+        "transparency_label": analysis["transparency_label"],
         "signals": analysis["signals"],
         "appeal": None,
     }
@@ -388,6 +412,7 @@ def submit():
         "attribution": analysis["attribution"],
         "ai_score": analysis["ai_score"],
         "confidence": analysis["confidence"],
+        "transparency_label": analysis["transparency_label"],
         "signals": analysis["signals"],
         "text_preview": text[:250],
     })
@@ -399,8 +424,51 @@ def submit():
         "attribution": analysis["attribution"],
         "ai_score": analysis["ai_score"],
         "confidence": analysis["confidence"],
-        "transparency_label": label,
+        "transparency_label": analysis["transparency_label"],
         "signals": analysis["signals"],
+    })
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json(silent=True) or {}
+    content_id = str(data.get("content_id", "")).strip()
+    creator_reasoning = str(data.get("creator_reasoning", "")).strip()
+
+    if not content_id:
+        return jsonify({"error": "Missing required field: content_id"}), 400
+    if not creator_reasoning:
+        return jsonify({"error": "Missing required field: creator_reasoning"}), 400
+
+    submissions = load_submissions()
+    if content_id not in submissions:
+        return jsonify({"error": "Unknown content_id"}), 404
+
+    record = submissions[content_id]
+    record["status"] = "under_review"
+    record["appeal"] = {
+        "creator_reasoning": creator_reasoning,
+        "appealed_at": utc_now(),
+    }
+    submissions[content_id] = record
+    save_submissions(submissions)
+
+    log_event({
+        "event_type": "appeal_submitted",
+        "content_id": content_id,
+        "creator_id": record.get("creator_id"),
+        "status": "under_review",
+        "original_attribution": record.get("attribution"),
+        "original_ai_score": record.get("ai_score"),
+        "original_confidence": record.get("confidence"),
+        "appeal_reasoning": creator_reasoning,
+    })
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal was received and is now under review.",
+        "appeal_reasoning": creator_reasoning,
     })
 
 
