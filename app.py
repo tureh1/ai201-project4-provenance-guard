@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import statistics
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,6 +162,172 @@ TEXT
 
 
 # ---------------------------------------------------------------------------
+# Signal 2: Stylometric heuristics
+# ---------------------------------------------------------------------------
+
+def split_sentences(text: str) -> List[str]:
+    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    return sentences if sentences else [text.strip()]
+
+
+def tokenize_words(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z']+", text.lower())
+
+
+def stylometric_signal(text: str) -> Dict[str, Any]:
+    """
+    Measures structural regularity. AI text often has more uniform sentence lengths,
+    moderate vocabulary diversity, and lower punctuation/emotional irregularity.
+    Returns ai_score where higher means more AI-like.
+    """
+    words = tokenize_words(text)
+    sentences = split_sentences(text)
+    word_count = max(len(words), 1)
+
+    sentence_lengths = [len(tokenize_words(s)) for s in sentences if tokenize_words(s)]
+    avg_sentence_length = sum(sentence_lengths) / max(len(sentence_lengths), 1)
+    length_variance = statistics.pvariance(sentence_lengths) if len(sentence_lengths) > 1 else 0.0
+    type_token_ratio = len(set(words)) / word_count
+    punctuation_count = len(re.findall(r"[,;:!?()\-—]", text))
+    punctuation_density = punctuation_count / word_count
+
+    # Low variance and moderate/low vocabulary diversity push AI-like.
+    uniformity_score = 1.0 - clamp(length_variance / 80.0)
+    long_sentence_score = clamp((avg_sentence_length - 10.0) / 18.0)
+    low_diversity_score = clamp((0.72 - type_token_ratio) / 0.35)
+    low_punctuation_score = 1.0 - clamp(punctuation_density / 0.16)
+
+    ai_score = (
+        0.35 * uniformity_score
+        + 0.25 * long_sentence_score
+        + 0.25 * low_diversity_score
+        + 0.15 * low_punctuation_score
+    )
+
+    return {
+        "name": "stylometric_heuristics",
+        "ai_score": round(clamp(ai_score), 4),
+        "metrics": {
+            "word_count": word_count,
+            "sentence_count": len(sentences),
+            "avg_sentence_length": round(avg_sentence_length, 2),
+            "sentence_length_variance": round(length_variance, 2),
+            "type_token_ratio": round(type_token_ratio, 3),
+            "punctuation_density": round(punctuation_density, 3),
+        },
+        "reason": "Scores structural regularity, vocabulary diversity, and punctuation density.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signal 3: AI phrase / generic-polish heuristic (ensemble signal)
+# ---------------------------------------------------------------------------
+
+def phrase_pattern_signal(text: str) -> Dict[str, Any]:
+    """
+    Detects generic AI-like phrasing and overly polished connective language.
+    This is a third distinct signal for an ensemble approach.
+    """
+    lower = text.lower()
+    ai_phrases = [
+        "it is important to note",
+        "in conclusion",
+        "furthermore",
+        "moreover",
+        "as a result",
+        "plays a crucial role",
+        "transformative",
+        "paradigm shift",
+        "various sectors",
+        "stakeholders",
+        "ethical implications",
+        "responsible deployment",
+        "in today's rapidly evolving",
+        "delve into",
+        "tapestry",
+    ]
+    casual_markers = [
+        "lol", "lmao", "idk", "honestly", "tbh", "ngl", "kinda", "sorta",
+        "like", "wtf", "???", "!!!", "ok so", "i mean"
+    ]
+
+    phrase_hits = sum(1 for phrase in ai_phrases if phrase in lower)
+    casual_hits = sum(1 for marker in casual_markers if marker in lower)
+    words = tokenize_words(text)
+    word_count = max(len(words), 1)
+
+    phrase_score = clamp(phrase_hits / 4.0)
+    formality_score = clamp((word_count - 60) / 180.0) if phrase_hits else 0.0
+    casual_offset = clamp(casual_hits / 4.0)
+    ai_score = clamp(0.75 * phrase_score + 0.25 * formality_score - 0.45 * casual_offset)
+
+    return {
+        "name": "phrase_pattern_heuristic",
+        "ai_score": round(ai_score, 4),
+        "metrics": {
+            "ai_phrase_hits": phrase_hits,
+            "casual_marker_hits": casual_hits,
+            "word_count": word_count,
+        },
+        "reason": "Detects generic AI-like phrasing and offsets with casual human markers.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Combining signals into a calibrated confidence score
+# ---------------------------------------------------------------------------
+
+def combine_signals(signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Ensemble weighting:
+    - LLM judge: 50% because it captures holistic semantic/stylistic cues.
+    - Stylometrics: 30% because it captures structural regularity.
+    - Phrase pattern: 20% because it catches generic AI phrasing but is easy to fool.
+    """
+    weights = {
+        "llm_judge": 0.50,
+        "stylometric_heuristics": 0.30,
+        "phrase_pattern_heuristic": 0.20,
+    }
+    weighted_score = 0.0
+    total_weight = 0.0
+    for name, weight in weights.items():
+        signal = signals[name]
+        weighted_score += weight * float(signal["ai_score"])
+        total_weight += weight
+    ai_score = clamp(weighted_score / total_weight)
+    confidence = max(ai_score, 1.0 - ai_score)
+
+    # Asymmetric thresholds: a false positive (calling a human's work AI) is the
+    # worst outcome on a writing platform, so the AI band requires a high score
+    # (>= 0.70) while the human band is generous (<= 0.40). Borderline content
+    # lands in "uncertain" and is shown without a strong claim.
+    if ai_score >= 0.70:
+        attribution = "likely_ai"
+    elif ai_score <= 0.40:
+        attribution = "likely_human"
+    else:
+        attribution = "uncertain"
+
+    return {
+        "ai_score": round(ai_score, 4),
+        "confidence": round(confidence, 4),
+        "attribution": attribution,
+        "weights": weights,
+    }
+
+
+def analyze_content(text: str) -> Dict[str, Any]:
+    signals = {
+        "llm_judge": llm_detection_signal(text),
+        "stylometric_heuristics": stylometric_signal(text),
+        "phrase_pattern_heuristic": phrase_pattern_signal(text),
+    }
+    combined = combine_signals(signals)
+    return {**combined, "signals": signals}
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -169,7 +336,7 @@ def home():
     return jsonify({
         "app": APP_NAME,
         "endpoints": {
-            "POST /submit": "Analyze text for attribution (signal 1 only for now).",
+            "POST /submit": "Analyze text for attribution and confidence.",
             "GET /log": "Return recent structured audit log entries.",
             "GET /content/<content_id>": "Return one stored content record.",
         },
@@ -190,20 +357,11 @@ def submit():
         return jsonify({"error": "Text must be at least 40 characters for meaningful analysis."}), 400
 
     content_id = str(uuid.uuid4())
+    analysis = analyze_content(text)
 
-    # Milestone 3: a single signal (the LLM judge). Confidence scoring and the
-    # transparency label are placeholders here and are implemented in M4 and M5.
-    signal = llm_detection_signal(text)
-    llm_score = signal["ai_score"]
-    if llm_score >= 0.70:
-        attribution = "likely_ai"
-    elif llm_score <= 0.40:
-        attribution = "likely_human"
-    else:
-        attribution = "uncertain"
-
-    confidence = 0.5  # placeholder until M4 confidence scoring
-    label = "Placeholder label — confidence scoring and transparency label arrive in later milestones."
+    # Milestone 4: real confidence scoring is wired in. The transparency label
+    # is still a placeholder; the three reader-facing variants arrive in M5.
+    label = "Placeholder label — the three transparency-label variants arrive in M5."
 
     record = {
         "content_id": content_id,
@@ -211,11 +369,11 @@ def submit():
         "created_at": utc_now(),
         "text": text,
         "status": "classified",
-        "attribution": attribution,
-        "llm_score": llm_score,
-        "confidence": confidence,
+        "attribution": analysis["attribution"],
+        "ai_score": analysis["ai_score"],
+        "confidence": analysis["confidence"],
         "transparency_label": label,
-        "signals": {"llm_judge": signal},
+        "signals": analysis["signals"],
         "appeal": None,
     }
     submissions = load_submissions()
@@ -227,9 +385,10 @@ def submit():
         "content_id": content_id,
         "creator_id": creator_id,
         "status": "classified",
-        "attribution": attribution,
-        "llm_score": llm_score,
-        "confidence": confidence,
+        "attribution": analysis["attribution"],
+        "ai_score": analysis["ai_score"],
+        "confidence": analysis["confidence"],
+        "signals": analysis["signals"],
         "text_preview": text[:250],
     })
 
@@ -237,11 +396,11 @@ def submit():
         "content_id": content_id,
         "creator_id": creator_id,
         "status": "classified",
-        "attribution": attribution,
-        "llm_score": llm_score,
-        "confidence": confidence,
+        "attribution": analysis["attribution"],
+        "ai_score": analysis["ai_score"],
+        "confidence": analysis["confidence"],
         "transparency_label": label,
-        "signals": {"llm_judge": signal},
+        "signals": analysis["signals"],
     })
 
 
