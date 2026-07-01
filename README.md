@@ -6,6 +6,10 @@ The goal is not to police creativity. Perfect AI detection is an unsolved proble
 
 ---
 
+## DEMO VIDEO
+
+https://drive.google.com/file/d/19avVHImO0k5xxvjQoUS567iSajFqaNVz/view?usp=sharing
+
 ## Table of contents
 - [Quick start](#quick-start)
 - [API reference](#api-reference)
